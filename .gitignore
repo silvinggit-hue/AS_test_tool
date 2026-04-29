@@ -1,0 +1,39 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Build / packaging
+build/
+dist/
+*.spec
+
+# Logs / runtime outputs
+logs/
+output/
+results/
+*.log
+
+# Local config / secrets / environment
+config/settings.local.py
+config/settings.private.py
+.env
+.env.*
+
+# Device / firmware / test assets
+firmware/
+*.bin
+*.img
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Temp / cache
+*.tmp
+*.bak
+*.cache

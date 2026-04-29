@@ -1,0 +1,2576 @@
+================================================================================
+FOLDER: core
+PYTHON FILE COUNT: 13
+================================================================================
+
+FILES:
+- board_model_map.py
+- cam_api_client.py
+- cam_info_reader.py
+- cam_status_reader.py
+- digest.py
+- display_names.py
+- firmware_upload.py
+- http_client.py
+- kv_utils.py
+- password_change.py
+- phase3_api.py
+- probe.py
+- readparam_keys.py
+
+################################################################################
+FILE: board_model_map.py
+PATH: core/board_model_map.py
+################################################################################
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+from typing import Dict
+
+log = logging.getLogger(__name__)
+
+
+def _read_text_with_fallback(path: Path) -> str:
+    """
+    board_model_map 파일은 인코딩이 혼재될 수 있어 순차적으로 시도한다.
+    """
+    errors = []
+
+    for enc in ("utf-8-sig", "utf-8", "cp949"):
+        try:
+            return path.read_text(encoding=enc)
+        except Exception as e:
+            errors.append(f"{enc}: {e}")
+
+    raise RuntimeError(
+        f"Failed to read board_model_map file: {path}\n" + "\n".join(errors)
+    )
+
+
+def load_board_model_map(path: str | Path) -> Dict[str, str]:
+    """
+    지원 형식:
+      BOARDID=MODELNAME
+      BOARDID , MODELNAME
+      BOARDID MODELNAME
+
+    - '#' 주석 및 빈 줄 무시
+    - BOARDID는 문자열 그대로 key로 사용
+    """
+    p = Path(path)
+    if not p.exists():
+        log.warning("[BOARD_MAP] file not found: %s", p)
+        return {}
+
+    try:
+        text = _read_text_with_fallback(p)
+    except Exception:
+        log.exception("[BOARD_MAP] failed to read file: %s", p)
+        return {}
+
+    out: Dict[str, str] = {}
+
+    for lineno, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
+
+        if not line or line.startswith("#"):
+            continue
+
+        key: str | None = None
+        val: str | None = None
+
+        if "=" in line:
+            key, val = line.split("=", 1)
+        elif "," in line:
+            key, val = line.split(",", 1)
+        else:
+            parts = line.split()
+            if len(parts) >= 2:
+                key = parts[0]
+                val = " ".join(parts[1:])
+
+        if key is None or val is None:
+            log.warning("[BOARD_MAP] skip invalid line %d: %r", lineno, raw)
+            continue
+
+        key = key.strip()
+        val = val.strip()
+
+        if not key or not val:
+            log.warning("[BOARD_MAP] skip empty key/value at line %d: %r", lineno, raw)
+            continue
+
+        out[key.upper().lstrip("0X")] = val
+
+    log.info("[BOARD_MAP] loaded %d entries from %s", len(out), p)
+    return out
+
+################################################################################
+FILE: cam_api_client.py
+PATH: core/cam_api_client.py
+################################################################################
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import logging
+import os
+import time
+from dataclasses import dataclass
+from typing import Optional
+from urllib.parse import quote, urljoin, urlparse, urlsplit
+
+import requests
+
+from models.dto import ApiError
+from core.http_client import HttpResponse, _build_session
+from core.http_client import http_get
+from core.digest import DigestChallenge, parse_www_authenticate_digest
+
+log = logging.getLogger(__name__)
+
+
+# ----------------------------
+# helpers
+# ----------------------------
+def _pick_digest_header(www_list: list[str]) -> str | None:
+    for h in (www_list or []):
+        if h and "digest" in h.lower():
+            return h
+    return www_list[0] if www_list else None
+
+
+def _pick_qop(qop_raw: str) -> str:
+    if not qop_raw:
+        return "auth"
+    items = [x.strip().lower() for x in qop_raw.split(",") if x.strip()]
+    return "auth" if "auth" in items else (items[0] if items else "auth")
+
+
+def _uri_from_full_url(url: str) -> str:
+    sp = urlsplit(url)
+    path = sp.path or "/"
+    if not path.startswith("/"):
+        path = "/" + path
+    return path
+
+
+def _looks_like_auth_error(body: str | None) -> bool:
+    """
+    일부 장비는 digest 실패 시에도 200을 반환하고 바디에 인증 오류를 포함한다.
+    """
+    if not body:
+        return False
+    t = body.lower()
+    needles = [
+        "authentication error",
+        "access denied",
+        "denied",
+        "auth error",
+        "unauthorized",
+        "<h2>authentication error",
+    ]
+    return any(n in t for n in needles)
+
+
+@dataclass
+class _DigestState:
+    challenge: DigestChallenge
+    nc: int = 0
+    cnonce: str = ""
+
+    def reset(self, new_challenge: DigestChallenge) -> None:
+        self.challenge = new_challenge
+        self.nc = 0
+        self.cnonce = ""
+
+    def next_nc_hex(self) -> str:
+        if not self.cnonce:
+            self.cnonce = os.urandom(8).hex()
+        self.nc += 1
+        return f"{self.nc:08x}"
+
+
+@dataclass
+class CamApiClient:
+    base_url: str
+    root_path: str
+    username: str
+    password: str
+    auth_scheme: str  # "digest" | "basic" | "none"
+    timeout: object   # settings.timeout (read_sec)
+    retry: object     # settings.retry (unused here)
+    verify_tls: bool = False
+
+    _session: Optional[requests.Session] = None
+    _digest_state: Optional[_DigestState] = None
+
+    # -------------------------
+    # session / url helpers
+    # -------------------------
+    def _get_session(self) -> requests.Session:
+        if self._session is None:
+            self._session = _build_session(verify_tls=bool(self.verify_tls))
+        return self._session
+
+    def with_shared_session(self, sess: requests.Session) -> "CamApiClient":
+        self._session = sess
+        return self
+
+    def _make_url(self, tail: str) -> str:
+        root = self.root_path or ""
+        if root and not root.endswith("/"):
+            root += "/"
+        if tail.startswith("/"):
+            tail = tail[1:]
+        return urljoin(self.base_url.rstrip("/") + "/", root.lstrip("/") + tail)
+
+    def _make_abs_url(self, path: str) -> str:
+        if not path.startswith("/"):
+            path = "/" + path
+        return self.base_url.rstrip("/") + path
+
+    # -------------------------
+    # headers
+    # -------------------------
+    def _default_headers_for_url(self, url: str) -> dict[str, str]:
+        p = urlparse(url)
+        path = p.path or "/"
+
+        if path == "/" or path == "":
+            return {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AS_test_tool_v4",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Upgrade-Insecure-Requests": "1",
+                "Connection": "keep-alive",
+            }
+
+        if (
+            ("/ReadParam" in path)
+            or ("/WriteParam" in path)
+            or ("/GetState" in path)
+            or ("/SendPTZ" in path)
+            or ("/SetState" in path)
+        ):
+            return {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AS_test_tool_v4",
+                "Accept": "text/plain, */*; q=0.01",
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": self.base_url.rstrip("/") + "/",
+                "Connection": "keep-alive",
+            }
+
+        return {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AS_test_tool_v4",
+            "Accept": "*/*",
+            "Connection": "keep-alive",
+        }
+
+    def _merge_headers(self, url: str, extra: dict[str, str] | None) -> dict[str, str]:
+        h = dict(self._default_headers_for_url(url))
+        if extra:
+            h.update(extra)
+        return h
+
+    # -------------------------
+    # request core (RemoteDisconnected 1회 재시도)
+    # -------------------------
+    def _request_raw(self, url: str, headers: dict[str, str] | None = None, *, read_body: bool = True) -> HttpResponse:
+        sess = self._get_session()
+        timeout_sec = float(getattr(self.timeout, "read_sec", 6.0) or 6.0)
+
+        for attempt in range(1, 3):
+            try:
+                r = sess.get(
+                    url,
+                    headers=headers or {},
+                    timeout=timeout_sec,
+                    allow_redirects=False,
+                    verify=bool(self.verify_tls),
+                )
+                body = r.text if read_body else ""
+                hdrs = {k: v for k, v in r.headers.items()}
+                return HttpResponse(status=int(r.status_code), body=body, headers=hdrs)
+
+            except requests.exceptions.Timeout as e:
+                log.warning(
+                    "[REQ-FAIL] timeout attempt=%s url=%s timeout=%ss err=%s",
+                    attempt,
+                    url,
+                    timeout_sec,
+                    e,
+                )
+                raise ApiError(kind="timeout", message="timeout", detail=str(e))
+
+            except requests.exceptions.ConnectionError as e:
+                msg = str(e)
+                log.warning("[REQ-FAIL] connerror attempt=%s url=%s err=%s", attempt, url, msg)
+                if ("RemoteDisconnected" in msg or "Remote end closed connection" in msg) and attempt < 2:
+                    time.sleep(0.25)
+                    continue
+                raise ApiError(kind="network", message="request failed", detail=msg)
+
+            except requests.exceptions.SSLError as e:
+                log.warning("[REQ-FAIL] ssl attempt=%s url=%s err=%s", attempt, url, e)
+                raise ApiError(kind="ssl", message="ssl handshake error", detail=str(e))
+
+            except requests.exceptions.RequestException as e:
+                log.warning("[REQ-FAIL] requestexc attempt=%s url=%s err=%s", attempt, url, e)
+                raise ApiError(kind="network", message="request failed", detail=str(e))
+
+        raise ApiError(kind="network", message="request failed", detail="unexpected")
+
+    # -------------------------
+    # digest
+    # -------------------------
+    def _ensure_digest_state(self) -> _DigestState:
+        """
+        Digest challenge(401 + WWW-Authenticate)를 얻는다.
+
+        일부 펌웨어에서 requests 기반의 최초 요청이 무응답/timeout이 발생할 수 있어,
+        challenge 획득은 urllib 기반(http_get)으로 수행한다.
+        """
+        if self._digest_state is not None:
+            return self._digest_state
+
+        timeout_sec = 2.0
+        headers = {"User-Agent": "AS_test_tool_v4/probe"}
+
+        candidates = [
+            self._make_url("ReadParam?action=readparam&ETC_MIN_PASSWORD_LEN=0"),
+            self._make_url("ReadParam?action=readparam&SYS_VERSION=0"),
+            self._make_url("GetState?action=getrate&GRS_VENCFRAME1=0"),
+            self._make_abs_url("/"),
+        ]
+
+        last_status: int | None = None
+        last_detail: str | None = None
+
+        for url in candidates:
+            try:
+                r0 = http_get(
+                    url=url,
+                    headers=headers,
+                    timeout_sec=timeout_sec,
+                    verify_tls=bool(self.verify_tls),
+                    read_body=False,
+                )
+                last_status = int(r0.status)
+
+                if r0.status == 401:
+                    www = r0.header_all("WWW-Authenticate")
+                    h = _pick_digest_header(www)
+                    if not h:
+                        last_detail = "401 but no WWW-Authenticate"
+                        continue
+
+                    chall = parse_www_authenticate_digest(h)
+                    self._digest_state = _DigestState(challenge=chall)
+                    return self._digest_state
+
+                continue
+
+            except ApiError as e:
+                last_detail = f"{e.kind}:{e.message}:{(e.detail or '')[:120]}"
+                continue
+            except Exception as e:
+                last_detail = str(e)[:200]
+                continue
+
+        raise ApiError(
+            kind="auth",
+            message="cannot obtain digest challenge (no 401 with WWW-Authenticate)",
+            status_code=last_status,
+            detail=last_detail,
+        )
+
+    def _build_digest_authz(self, method: str, url: str) -> str:
+        st = self._ensure_digest_state()
+        chall = st.challenge
+
+        uri = _uri_from_full_url(url)
+        qop = _pick_qop(getattr(chall, "qop", "") or "")
+        nc = st.next_nc_hex()
+        cnonce = st.cnonce
+
+        algo = (getattr(chall, "algorithm", "") or "MD5").upper()
+        H = hashlib.sha256 if "SHA-256" in algo else hashlib.md5
+
+        def Hhex(s: str) -> str:
+            return H(s.encode("utf-8")).hexdigest()
+
+        realm = chall.realm
+        nonce = chall.nonce
+
+        ha1 = Hhex(f"{self.username}:{realm}:{self.password}")
+        ha2 = Hhex(f"{method}:{uri}")
+        response = Hhex(f"{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}")
+
+        base = (
+            f'Digest username="{self.username}", realm="{realm}", nonce="{nonce}", '
+            f'uri="{uri}", algorithm={algo}, response="{response}", '
+            f'qop={qop}, nc={nc}, cnonce="{cnonce}"'
+        )
+        if getattr(chall, "opaque", None) is not None:
+            base += f', opaque="{chall.opaque}"'
+        return base
+
+    def _maybe_refresh_digest_challenge(self, resp: HttpResponse) -> bool:
+        www = resp.header_all("WWW-Authenticate")
+        h = _pick_digest_header(www)
+        if not h or "digest" not in h.lower():
+            return False
+
+        try:
+            new_chall = parse_www_authenticate_digest(h)
+        except Exception:
+            return False
+
+        if self._digest_state is None:
+            self._digest_state = _DigestState(challenge=new_chall)
+            return True
+
+        old = self._digest_state.challenge
+        if (old.nonce != new_chall.nonce) or (old.realm != new_chall.realm) or (old.algorithm != new_chall.algorithm):
+            self._digest_state.reset(new_chall)
+        else:
+            self._digest_state.challenge = new_chall
+        return True
+
+    def _auth_headers(self, method: str, url: str) -> dict[str, str]:
+        scheme = (self.auth_scheme or "").lower().strip()
+
+        if scheme == "none":
+            return {}
+
+        if scheme == "basic":
+            token = base64.b64encode(f"{self.username}:{self.password}".encode()).decode()
+            return {"Authorization": f"Basic {token}"}
+
+        if scheme == "digest":
+            return {"Authorization": self._build_digest_authz(method, url)}
+
+        raise ApiError(kind="param", message="invalid auth_scheme", detail=scheme)
+
+    # -------------------------
+    # main request
+    # -------------------------
+    def _request(self, tail: str) -> HttpResponse:
+        url = self._make_url(tail)
+        log.info("[REQ] GET %s", url)
+
+        scheme = (self.auth_scheme or "").lower().strip()
+        auth = self._auth_headers("GET", url) if scheme != "none" else {}
+        headers = self._merge_headers(url, auth)
+
+        resp = self._request_raw(url, headers=headers)
+        log.info("[RESP] %s %s", resp.status, url)
+
+        if scheme == "digest" and resp.status == 401:
+            if self._maybe_refresh_digest_challenge(resp):
+                auth2 = self._auth_headers("GET", url)
+                headers2 = self._merge_headers(url, auth2)
+                resp2 = self._request_raw(url, headers=headers2)
+                log.info("[RESP-RETRY] %s %s", resp2.status, url)
+                return resp2
+
+        return resp
+
+    # -------------------------
+    # ReadParam
+    # -------------------------
+    def read_param_text(self, key: str) -> str:
+        tail = f"ReadParam?action=readparam&{quote(key, safe='')}=0"
+        resp = self._request(tail)
+
+        if resp.status == 200:
+            if _looks_like_auth_error(resp.body):
+                raise ApiError(
+                    kind="auth",
+                    message="authentication failed",
+                    status_code=200,
+                    detail=(resp.body or "")[:200],
+                )
+            return resp.body or ""
+
+        if resp.status in (401, 403):
+            raise ApiError(kind="auth", message="authentication failed", status_code=resp.status, detail=(resp.body or "")[:200])
+
+        raise ApiError(kind="http", message="read_param failed", status_code=resp.status, detail=(resp.body or "")[:200])
+
+    def read_param_value(self, key: str) -> str:
+        txt = self.read_param_text(key)
+        prefix = key + "="
+        for line in (txt or "").splitlines():
+            if line.startswith(prefix):
+                return line.split("=", 1)[1].strip()
+        return ""
+
+    def read_params_text(self, keys: list[str]) -> str:
+        if not keys:
+            return ""
+
+        parts: list[str] = []
+        for k in keys:
+            parts.append(f"{quote(k, safe='')}=0")
+
+        tail = "ReadParam?action=readparam&" + "&".join(parts)
+        resp = self._request(tail)
+
+        if resp.status == 200:
+            return resp.body or ""
+
+        if resp.status in (401, 403):
+            raise ApiError(
+                kind="auth",
+                message="authentication failed",
+                status_code=resp.status,
+                detail=(resp.body or "")[:200],
+            )
+
+        raise ApiError(
+            kind="http",
+            message="read_params failed",
+            status_code=resp.status,
+            detail=(resp.body or "")[:200],
+        )
+
+    # -------------------------
+    # WriteParam
+    # -------------------------
+    def write_param_raw(self, kv: dict[str, str]) -> HttpResponse:
+        if not kv:
+            raise ApiError(kind="param", message="write_param_raw: empty kv")
+
+        parts: list[str] = ["WriteParam?action=writeparam"]
+        for k, v in kv.items():
+            kq = quote(str(k), safe="")
+            vq = quote(str(v), safe=".")  # IP '.' 유지
+            parts.append(f"{kq}={vq}")
+
+        tail = "&".join(parts)
+        resp = self._request(tail)
+
+        if resp.status == 200 and _looks_like_auth_error(resp.body):
+            raise ApiError(
+                kind="auth",
+                message="authentication failed",
+                status_code=200,
+                detail=(resp.body or "")[:200],
+            )
+
+        return resp
+
+    # -------------------------
+    # GetState
+    # -------------------------
+    def get_state_text(self, action: str, params: dict[str, str]) -> str:
+        if not action:
+            raise ApiError(kind="param", message="get_state_text: empty action")
+
+        parts = [f"GetState?action={quote(action, safe='')}"]
+        for k, v in (params or {}).items():
+            parts.append(f"{quote(str(k), safe='')}={quote(str(v), safe='.')}")
+
+        tail = "&".join(parts)
+        resp = self._request(tail)
+
+        if resp.status == 200:
+            if _looks_like_auth_error(resp.body):
+                raise ApiError(
+                    kind="auth",
+                    message="authentication failed",
+                    status_code=200,
+                    detail=(resp.body or "")[:200],
+                )
+            return resp.body or ""
+
+        if resp.status in (401, 403):
+            raise ApiError(
+                kind="auth",
+                message="authentication failed",
+                status_code=resp.status,
+                detail=(resp.body or "")[:200],
+            )
+
+        raise ApiError(
+            kind="http",
+            message="get_state failed",
+            status_code=resp.status,
+            detail=(resp.body or "")[:200],
+        )
+
+    def get_state_values_text(self, action: str, keys: list[str]) -> str:
+        """
+        예) action=getrate, keys=["GRS_VENCFRAME1", "GRS_VENCBITRATE1", ...]
+        -> GetState?action=getrate&KEY=0&KEY2=0...
+        """
+        if not keys:
+            return ""
+        params = {k: "0" for k in keys}
+        return self.get_state_text(action=action, params=params)
+
+    # -------------------------
+    # absolute GET
+    # -------------------------
+    def get_abs(self, path: str) -> HttpResponse:
+        url = self._make_abs_url(path)
+        log.info("[REQ] GET %s", url)
+
+        scheme = (self.auth_scheme or "").lower().strip()
+        auth = self._auth_headers("GET", url) if scheme != "none" else {}
+        headers = self._merge_headers(url, auth)
+
+        resp = self._request_raw(url, headers=headers)
+        log.info("[RESP] %s %s", resp.status, url)
+
+        if scheme == "digest" and resp.status == 401:
+            if self._maybe_refresh_digest_challenge(resp):
+                auth2 = self._auth_headers("GET", url)
+                headers2 = self._merge_headers(url, auth2)
+                resp2 = self._request_raw(url, headers=headers2)
+                log.info("[RESP-RETRY] %s %s", resp2.status, url)
+                return resp2
+
+        return resp
+
+    def _looks_like_auth_error_body(self, body: str) -> bool:
+        if not body:
+            return False
+        b = body.lower()
+        return (
+            "authentication error" in b
+            or "access denied" in b
+            or "<h2>authentication error" in b
+            or "ss denied" in b
+        )
+
+################################################################################
+FILE: cam_info_reader.py
+PATH: core/cam_info_reader.py
+################################################################################
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import Iterable
+
+from core.cam_api_client import CamApiClient
+from core.kv_utils import parse_kv_lines
+from core.readparam_keys import (
+    DEVICE_INFO_FAST_KEYS,
+    DEVICE_INFO_KEYS,
+    DEVICE_INFO_SLOW_KEYS,
+)
+from models.dto import ApiError
+
+log = logging.getLogger(__name__)
+
+PASSWORD_TEST_KEY = "ETC_MIN_PASSWORD_LEN"
+
+
+@dataclass(frozen=True)
+class CamInfoReader:
+    client: CamApiClient
+
+    FAST_KEYS: tuple[str, ...] = DEVICE_INFO_FAST_KEYS
+    SLOW_KEYS: tuple[str, ...] = DEVICE_INFO_SLOW_KEYS
+
+    @staticmethod
+    def _chunks(items: list[str], n: int) -> Iterable[list[str]]:
+        n = max(1, int(n))
+        for i in range(0, len(items), n):
+            yield items[i : i + n]
+
+    def _read_multi_with_fallback(self, keys: list[str]) -> str:
+        """
+        ReadParam 멀티 요청이 불안정한 장비가 있어 단계적으로 분할하여 시도한다.
+        """
+        if not keys:
+            return ""
+
+        try:
+            return (self.client.read_params_text(keys) or "").strip()
+        except ApiError as e:
+            if e.kind not in ("timeout", "network", "http", "auth"):
+                raise
+
+        out_lines: list[str] = []
+        try:
+            for ck in self._chunks(keys, 6):
+                txt = self.client.read_params_text(ck)
+                if txt:
+                    out_lines.append(txt.rstrip("\r\n"))
+            return "\n".join(out_lines).strip()
+        except ApiError as e:
+            if e.kind not in ("timeout", "network", "http", "auth"):
+                raise
+
+        out_lines = []
+        try:
+            for ck in self._chunks(keys, 3):
+                txt = self.client.read_params_text(ck)
+                if txt:
+                    out_lines.append(txt.rstrip("\r\n"))
+            return "\n".join(out_lines).strip()
+        except ApiError as e:
+            if e.kind not in ("timeout", "network", "http", "auth"):
+                raise
+
+        out_lines = []
+        for k in keys:
+            try:
+                txt = self.client.read_param_text(k)
+                if txt:
+                    out_lines.append(txt.rstrip("\r\n"))
+            except ApiError as e:
+                log.warning(
+                    "[INFO] ReadParam single fail key=%s kind=%s status=%s",
+                    k,
+                    e.kind,
+                    e.status_code,
+                )
+                continue
+
+        return "\n".join(out_lines).strip()
+
+    def read_params_text(self, keys: list[str], *, include_slow: bool = False) -> str:
+        if not keys:
+            return ""
+
+        scheme = (getattr(self.client, "auth_scheme", "") or "").lower().strip()
+
+        if scheme == "basic":
+            req_fast = [k for k in keys if k in self.FAST_KEYS]
+            req_slow = [k for k in keys if k in self.SLOW_KEYS]
+            req_rest = [k for k in keys if (k not in self.FAST_KEYS and k not in self.SLOW_KEYS)]
+
+            out: list[str] = []
+
+            if req_fast:
+                out.append(self._read_multi_with_fallback(req_fast))
+
+            if req_rest:
+                out.append(self._read_multi_with_fallback(req_rest))
+
+            if include_slow and req_slow:
+                out.append(self._read_multi_with_fallback(req_slow))
+            else:
+                if req_slow:
+                    log.info("[INFO] basic scheme: skip slow keys=%s", ",".join(req_slow))
+
+            return "\n".join([t for t in out if t]).strip()
+
+        return self._read_multi_with_fallback(keys)
+
+    def get_info_block(self) -> dict[str, str]:
+        text = self.read_params_text(list(DEVICE_INFO_KEYS), include_slow=False)
+        data = parse_kv_lines(text)
+
+        raw = data.get("SYS_BOARDID")
+        if raw is not None:
+            try:
+                n = int(raw)
+                data["BOARDID_DEC"] = str(n)
+                data["BOARDID_HEX"] = hex(n)
+            except Exception:
+                pass
+
+        return data
+
+################################################################################
+FILE: cam_status_reader.py
+PATH: core/cam_status_reader.py
+################################################################################
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+
+from core.cam_api_client import CamApiClient
+from core.kv_utils import parse_kv_lines, pick
+from core.readparam_keys import (
+    STATUS_ETHTOOL_KEYS,
+    STATUS_INPUT_KEYS,
+    STATUS_RATE_KEYS,
+    STATUS_READPARAM_KEYS,
+)
+from models.dto import ApiError
+
+
+@dataclass(frozen=True)
+class CamStatusReader:
+    client: CamApiClient
+
+    READPARAM_KEYS: tuple[str, ...] = STATUS_READPARAM_KEYS
+    RATE_KEYS: tuple[str, ...] = STATUS_RATE_KEYS
+    INPUT_KEYS: tuple[str, ...] = STATUS_INPUT_KEYS
+    ETHTOOL_KEYS: tuple[str, ...] = STATUS_ETHTOOL_KEYS
+
+    @staticmethod
+    def _extract_ints(text: str | None) -> list[str]:
+        if not text:
+            return []
+        return re.findall(r"(-?\d+)", text)
+
+    @staticmethod
+    def _parse_cds_current_pair(text: str | None) -> tuple[str | None, str | None]:
+        if not text:
+            return (None, None)
+
+        t = " ".join(str(text).split())
+        m_cur = re.search(r"\bCurrent\s+Value\s+(-?\d+)\b", t, flags=re.IGNORECASE)
+        m_cds = re.search(r"\bCDS\s+Value\s+(-?\d+)\b", t, flags=re.IGNORECASE)
+        cds = m_cds.group(1) if m_cds else None
+        cur = m_cur.group(1) if m_cur else None
+        return (cds, cur)
+
+    def _getstate_text(self, action: str, keys: tuple[str, ...], *, optional: bool = False) -> str:
+        if not keys:
+            return ""
+
+        parts = "&".join([f"{k}=0" for k in keys])
+        tail = f"GetState?action={action}&{parts}"
+
+        try:
+            resp = self.client._request(tail)  # pylint: disable=protected-access
+        except ApiError:
+            if optional:
+                return ""
+            raise
+
+        if resp.status == 200:
+            return resp.body or ""
+
+        if optional:
+            return ""
+
+        if resp.status in (401, 403):
+            raise ApiError(
+                kind="auth",
+                message="authentication failed",
+                status_code=resp.status,
+                detail=(resp.body or "")[:200],
+            )
+
+        raise ApiError(
+            kind="http",
+            message="getstate failed",
+            status_code=resp.status,
+            detail=(resp.body or "")[:200],
+        )
+
+    @staticmethod
+    def _format_link_speed_from_ethtool(code: str | None) -> str | None:
+        if code is None:
+            return None
+        v = str(code).strip()
+        if v == "":
+            return None
+
+        # 당신이 확인한 매핑: 24=1G, 22=100M
+        if v == "24":
+            return "1G"
+        if v == "22":
+            return "100M"
+
+        # 혹시 다른 코드가 나오면 raw 표기
+        return f"ETHTOOL({v})"
+
+    def read_status_block(self) -> dict:
+        rp_text = self.client.read_params_text(list(self.READPARAM_KEYS))
+        rp_kv = parse_kv_lines(rp_text)
+
+        rate_text = self._getstate_text("getrate", self.RATE_KEYS, optional=False)
+        rate_kv = parse_kv_lines(rate_text)
+
+        in_text = self._getstate_text("getinput", self.INPUT_KEYS, optional=True)
+        in_kv = parse_kv_lines(in_text) if in_text else {}
+
+        cds_raw = pick(rp_kv, "CAM_HI_CURRENT_Y", "GIS_CDS", "GIS_CDS_CUR", "GIS_CDS_CURRENT")
+
+        cds, cds_current = self._parse_cds_current_pair(cds_raw)
+        if cds is None and cds_current is None:
+            ints = self._extract_ints(cds_raw)
+            cds = ints[0] if len(ints) >= 1 else (cds_raw.strip() if cds_raw else None)
+            cds_current = ints[1] if len(ints) >= 2 else None
+
+        rtc = pick(rp_kv, "SYS_CURRENTTIME", "GIS_RTC", "RTC_TIME")
+        temp = pick(rp_kv, "SYS_BOARDTEMP", "SYS_BOARD_TEMP", "ETC_BOARDTEMP")
+        fan = pick(rp_kv, "SYS_FANSTATUS", "SYS_FAN_STATUS", "FAN_STATUS")
+
+        link_state = pick(rp_kv, "NET_LINKSTATE", "NET_LINK_STATE")
+        link_speed = pick(rp_kv, "NET_LINKSPEED", "NET_LINK_SPEED")
+        eth = (
+            f"{link_state or 'None'} / {link_speed or 'None'}"
+            if (link_state or link_speed)
+            else pick(rp_kv, "SYS_ETHERNET")
+        )
+
+        ethtool_kv: dict[str, str] = {}
+        if not eth or str(eth).strip() in ("", "None", "None / None"):
+            ethtool_text = self._getstate_text("ethtool", self.ETHTOOL_KEYS, optional=True)
+            if ethtool_text:
+                ethtool_kv = parse_kv_lines(ethtool_text)
+                sp = self._format_link_speed_from_ethtool(ethtool_kv.get("ETHTOOL"))
+                if sp:
+                    # link_state는 못 얻을 수도 있으니 speed만이라도 표시
+                    eth = f"link / {sp}"
+
+        fps1 = pick(rate_kv, "GRS_VENCFRAME1")
+        br1 = pick(rate_kv, "GRS_VENCBITRATE1")
+
+        raw_all = dict(rp_kv)
+        raw_all.update(rate_kv)
+        raw_all.update(in_kv)
+        raw_all.update(ethtool_kv)
+
+        return {
+            "temp": temp,
+            "cds": cds,
+            "cds_current": cds_current,
+            "rtc": rtc,
+            "fan": fan,
+            "eth": eth,
+            "rate": {"kbps": br1, "fps": fps1},
+            "raw": raw_all,
+        }
+
+################################################################################
+FILE: digest.py
+PATH: core/digest.py
+################################################################################
+
+from __future__ import annotations
+
+import hashlib
+import os
+import re
+from dataclasses import dataclass
+from typing import Dict, Optional
+
+
+@dataclass(frozen=True)
+class DigestChallenge:
+    realm: str
+    nonce: str
+    qop: str = "auth"
+    algorithm: str = "MD5"  # "MD5" | "SHA-256"
+    opaque: str | None = None
+
+
+def parse_www_authenticate_digest(header: str) -> DigestChallenge:
+    """
+    Digest WWW-Authenticate challenge를 파싱한다.
+
+    Example:
+      WWW-Authenticate: Digest realm="...", nonce="...", qop="auth", algorithm=SHA-256, opaque="..."
+    """
+    if not header:
+        raise ValueError("empty WWW-Authenticate")
+
+    h = header.strip()
+    if h.lower().startswith("digest"):
+        h = h[len("digest") :].strip()
+
+    parts: Dict[str, str] = {}
+    for m in re.finditer(r'(\w+)=(".*?"|[^,]+)', h):
+        k = m.group(1).strip().lower()
+        v = m.group(2).strip()
+        if v.startswith('"') and v.endswith('"'):
+            v = v[1:-1]
+        parts[k] = v
+
+    realm = parts.get("realm") or ""
+    nonce = parts.get("nonce") or ""
+    qop = parts.get("qop") or "auth"
+    algo = (parts.get("algorithm") or "MD5").upper()
+    opaque = parts.get("opaque")  # keep opaque="" too
+
+    if not realm or not nonce:
+        raise ValueError(f"invalid digest challenge: realm/nonce missing ({parts})")
+
+    algo = "SHA-256" if "SHA-256" in algo else "MD5"
+    return DigestChallenge(realm=realm, nonce=nonce, qop=qop, algorithm=algo, opaque=opaque)
+
+
+def build_digest_authorization(
+    *,
+    method: str,
+    url: str,
+    username: str,
+    password: str,
+    challenge: DigestChallenge,
+    nc_int: int,
+    cnonce: Optional[str] = None,
+) -> str:
+    """
+    Authorization: Digest ... 헤더 값을 생성한다.
+
+    - url: full url
+    - uri: path+query extracted from url
+    - nc는 호출자(client)가 요청마다 증가시키는 값이다.
+    """
+    uri = "/" + url.split("://", 1)[-1].split("/", 1)[-1]
+    if not uri.startswith("/"):
+        uri = "/" + uri
+
+    nc = f"{int(nc_int):08x}"
+    cnonce = cnonce or os.urandom(8).hex()
+    qop = "auth"
+
+    H = hashlib.sha256 if challenge.algorithm == "SHA-256" else hashlib.md5
+
+    def Hhex(s: str) -> str:
+        return H(s.encode("utf-8")).hexdigest()
+
+    ha1 = Hhex(f"{username}:{challenge.realm}:{password}")
+    ha2 = Hhex(f"{method}:{uri}")
+    resp = Hhex(f"{ha1}:{challenge.nonce}:{nc}:{cnonce}:{qop}:{ha2}")
+
+    base = (
+        f'Digest username="{username}", realm="{challenge.realm}", nonce="{challenge.nonce}", '
+        f'uri="{uri}", response="{resp}", algorithm={challenge.algorithm}, '
+        f'qop={qop}, nc={nc}, cnonce="{cnonce}"'
+    )
+    if challenge.opaque is not None:
+        base += f', opaque="{challenge.opaque}"'
+
+    return base
+
+################################################################################
+FILE: display_names.py
+PATH: core/display_names.py
+################################################################################
+
+from __future__ import annotations
+
+
+DISPLAY_NAME_MAP: dict[str, str] = {
+    # ------------------------------------------------------------------
+    # Network
+    # ------------------------------------------------------------------
+    "NET_RTSPPORT": "RTSP Port",
+    "NET_MAC": "MAC Address",
+    "NET_LOCALIPMODE": "Local IP Mode",
+    "NET_LINKSTATE": "Link State",
+    "NET_LINK_STATE": "Link State",
+    "NET_LINKSPEED": "Link Speed",
+    "NET_LINK_SPEED": "Link Speed",
+    "NET_EXTRA_ID": "Extra ID",
+
+    # ------------------------------------------------------------------
+    # System
+    # ------------------------------------------------------------------
+    "SYS_BOARDID": "Board ID",
+    "SYS_MODE": "Type",
+    "SYS_MODELNAME": "Model",
+    "SYS_MODELNAME2": "Model",
+    "SYS_VERSION": "Firmware",
+    "SYS_MODULE_TYPE": "Module Type",
+    "SYS_MODULE_DETAIL": "Module Detail",
+    "SYS_PRODUCT_MODEL": "Product Model",
+    "SYS_LINKDOWN_NUM": "LD",
+    "SYS_RCV_VERSION": "RCV Version",
+    "SYS_TIMEFORMAT": "Time Display Format",
+    "SYS_STARTTIME": "System Booting Time",
+    "SYS_FTCAMERA_CDS": "CDS",
+    "SYS_AI_VERSION": "AI Version",
+    "SYS_ZOOMMODULE": "Zoom Module",
+    "SYS_ONVIFVERSION": "ONVIF Version",
+    "SYS_OPENSSLVERSION": "OpenSSL Version",
+    "SYS_CURRENTTIME": "Current Time",
+    "SYS_REBOOT": "Reboot",
+    "SYS_RESET_V2": "Reset",
+    "SYS_BOARDTEMP": "Board Temp",
+    "SYS_BOARD_TEMP": "Board Temp",
+    "SYS_ETHERNET": "Ethernet",
+    "SYS_FANSTATUS": "Fan Status",
+    "SYS_FAN_STATUS": "Fan Status",
+
+    # ------------------------------------------------------------------
+    # Camera / PTZ
+    # ------------------------------------------------------------------
+    "CAM_READMODULEVERSION": "Module Version",
+    "CAM_READMECAVERSION": "PTZ F/W",
+    "CAM_READPTZHWVERSION": "PTZ H/W Version",
+    "CAM_HI_CURRENT_Y": "CDS / Current Y",
+    "CAM_HI_TDN_MODE": "TDN",
+    "CAM_HI_TDN_FILTER": "ICR",
+
+    # ------------------------------------------------------------------
+    # Video
+    # ------------------------------------------------------------------
+    "VID_PREVIEWENABLE": "Preview Enable",
+    "VID_OUTPUTFORMAT": "Output Format",
+    "VID_INPUTFORMAT": "Input Format",
+    "VID_RESOLUTION": "Resolution",
+    "VID_FRAMERATE": "Frame Rate",
+    "VID_PREFERENCE": "Video Preference",
+    "VID_QUALITY": "Video Quality",
+    "VID_BANDWIDTH": "Bandwidth",
+    "VID_IINTERVAL": "I-Frame Interval",
+    "VID_USEDUAL": "Dual Stream Use",
+    "VID_DUALALGORITHM": "Dual Stream Algorithm",
+    "VID_DUALRESOLUTION": "Dual Stream Resolution",
+    "VID_DUALFRAMERATE": "Dual Stream Frame Rate",
+    "VID_DUALPREFERENCE": "Dual Stream Preference",
+    "VID_DUALQUALITY": "Dual Stream Quality",
+    "VID_DUALBANDWIDTH": "Dual Stream Bandwidth",
+    "VID_DUALIINTERVAL": "Dual Stream I-Frame Interval",
+
+    # ------------------------------------------------------------------
+    # Audio
+    # ------------------------------------------------------------------
+    "AUD_ENABLE": "Audio Enable",
+    "AUD_CODEC": "Audio Codec",
+    "AUD_ALGORITHM": "Audio Algorithm",
+    "AUD_AUDIOMODE": "Audio Mode",
+    "AUD_GAIN": "Audio Gain",
+    "AUD_INPUTGAIN": "Audio Input Gain",
+    "AUD_OUTPUTGAIN": "Audio Output Gain",
+    "AUD_SAMPLERATE": "Audio Sample Rate",
+    "AUD_BITRATE": "Audio Bit Rate",
+    "AUD_MUTE": "Audio Mute",
+
+    # ------------------------------------------------------------------
+    # Storage
+    # ------------------------------------------------------------------
+    "REC_DISKTYPE": "SD / USB",
+    "REC_DISKSIZE": "Disk Size",
+    "REC_DISKAVAILABLE": "Disk Available",
+
+    # ------------------------------------------------------------------
+    # Serial / Test
+    # ------------------------------------------------------------------
+    "SER_PROTOCOL_1": "Serial Protocol 1",
+    "SER_BITRATE_2": "Serial Bitrate 2",
+    "TEST_Power_CheckString": "Power Type",
+    "TEST_WRITE": "Test Write",
+    "ETC_MIN_PASSWORD_LEN": "Minimum Password Length",
+
+    # ------------------------------------------------------------------
+    # Status / CDS / RTC / Fan / Temp
+    # ------------------------------------------------------------------
+    "ETC_BOARDTEMP": "Board Temp",
+    "GIS_CDS": "CDS",
+    "GIS_CDS_CUR": "CDS Current",
+    "GIS_CDS_CURRENT": "CDS Current",
+    "GIS_RTC": "RTC Time",
+    "RTC_TIME": "RTC Time",
+    "FAN_STATUS": "Fan Status",
+    "ETHTOOL": "Ethernet Speed Raw",
+
+    # ------------------------------------------------------------------
+    # Rate
+    # ------------------------------------------------------------------
+    "GRS_VENCFRAME1": "Video1 FPS",
+    "GRS_VENCBITRATE1": "Video1 Bitrate",
+    "GRS_VENCFRAME2": "Video2 FPS",
+    "GRS_VENCBITRATE2": "Video2 Bitrate",
+    "GRS_VENCFRAME3": "Video3 FPS",
+    "GRS_VENCBITRATE3": "Video3 Bitrate",
+    "GRS_VENCFRAME4": "Video4 FPS",
+    "GRS_VENCBITRATE4": "Video4 Bitrate",
+    "GRS_AENCBITRATE1": "Audio Encode Bitrate",
+    "GRS_ADECBITRATE1": "Audio Decode Bitrate",
+    "GRS_ADECALGORITHM1": "Audio Decode Algorithm",
+    "GRS_ADECSAMPLERATE1": "Audio Decode Sample Rate",
+
+    # ------------------------------------------------------------------
+    # Input / Alarm
+    # ------------------------------------------------------------------
+    "GIS_SENSOR1": "Sensor 1",
+    "GIS_SENSOR2": "Sensor 2",
+    "GIS_SENSOR3": "Sensor 3",
+    "GIS_SENSOR4": "Sensor 4",
+    "GIS_SENSOR5": "Sensor 5",
+    "GIS_MOTION1": "Motion 1",
+    "GIS_MOTION2": "Motion 2",
+    "GIS_MOTION3": "Motion 3",
+    "GIS_MOTION4": "Motion 4",
+    "GIS_VIDEOLOSS1": "Video Loss 1",
+    "GIS_VIDEOLOSS2": "Video Loss 2",
+    "GIS_VIDEOLOSS3": "Video Loss 3",
+    "GIS_VIDEOLOSS4": "Video Loss 4",
+    "GIS_ALARM1": "Alarm 1",
+    "GIS_ALARM2": "Alarm 2",
+    "GIS_ALARM3": "Alarm 3",
+    "GIS_ALARM4": "Alarm 4",
+    "GIS_RECORD1": "Record 1",
+    "GIS_AIRWIPER": "Air Wiper",
+
+    # ------------------------------------------------------------------
+    # UI-only synthesized labels
+    # ------------------------------------------------------------------
+    "BOARDID_HEX": "Board ID",
+    "CDS": "CDS",
+    "CURRENT_Y": "Current Y",
+    "RATE1": "Primary",
+    "RATE2": "Secondary",
+    "RATE3": "Video3 Rate",
+    "RATE4": "Video4 Rate",
+    "RTC": "RTC Time",
+    "ETHERNET": "Ethernet",
+    "TEMP": "Board Temp",
+    "FAN": "Fan Status",
+}
+
+
+def display_name(key: str) -> str:
+    return DISPLAY_NAME_MAP.get(str(key), str(key))
+
+################################################################################
+FILE: firmware_upload.py
+PATH: core/firmware_upload.py
+################################################################################
+
+from __future__ import annotations
+
+import base64
+import logging
+import os
+import random
+import time
+import urllib.parse
+from dataclasses import dataclass
+from typing import Optional
+
+import requests
+
+from config.settings import RetrySettings
+from core.digest import parse_www_authenticate_digest, build_digest_authorization
+from core.http_client import _build_session
+from models.dto import ApiError
+
+log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class UploadResult:
+    status: int
+    body_tail: str
+
+
+def _flip_scheme(base_url: str) -> str:
+    if base_url.startswith("https://"):
+        return "http://" + base_url[len("https://") :]
+    if base_url.startswith("http://"):
+        return "https://" + base_url[len("http://") :]
+    return base_url
+
+
+def _is_remote_closed(detail: str) -> bool:
+    d = (detail or "").lower()
+    return (
+        "remote end closed connection without response" in d
+        or "remote disconnected" in d
+        or "remotedisconnected" in d
+        or "connection was closed" in d
+        or "connection reset by peer" in d
+        or "broken pipe" in d
+        or "eof occurred in violation of protocol" in d
+        or "read timed out" in d
+    )
+
+
+def _sleep_backoff(attempt: int, retry: RetrySettings) -> None:
+    sleep_s = float(retry.backoff_base_sec) * (2 ** (attempt - 1)) + random.random() * float(retry.backoff_jitter_sec)
+    time.sleep(max(0.0, sleep_s))
+
+
+def _as_api_error(e: Exception) -> ApiError:
+    if isinstance(e, requests.exceptions.SSLError):
+        return ApiError(kind="ssl", message="ssl error", detail=str(e))
+    if isinstance(e, requests.Timeout):
+        return ApiError(kind="timeout", message="timeout", detail=str(e))
+    if isinstance(e, requests.RequestException):
+        return ApiError(kind="network", message="network error", detail=str(e))
+    return ApiError(kind="network", message="unexpected network error", detail=str(e))
+
+
+def _normalize_root_path(root_path: str) -> str:
+    rp = (root_path or "").strip()
+    if not rp:
+        return ""
+    if not rp.startswith("/"):
+        rp = "/" + rp
+    if not rp.endswith("/"):
+        rp += "/"
+    return rp
+
+
+def upload_firmware_progress_html(
+    *,
+    base_url: str,
+    username: str,
+    password: str,
+    auth_scheme: str,  # "digest" | "basic" | "none"
+    verify_tls: bool,
+    timeout_sec: float,
+    retry: Optional[RetrySettings],
+    filepath: str,
+    root_path: str = "",
+    **_ignored,
+) -> UploadResult:
+    retry = retry or RetrySettings()
+
+    path = (filepath or "").strip()
+    if not path:
+        raise ApiError(kind="param", message="firmware path empty")
+    if not os.path.exists(path):
+        raise ApiError(kind="param", message="firmware file not found", detail=path)
+
+    filename = os.path.basename(path)
+
+    base_candidates = [base_url]
+    flipped = _flip_scheme(base_url)
+    if flipped != base_url:
+        base_candidates.append(flipped)
+
+    rp = _normalize_root_path(root_path)
+    upload_paths = ["progress.html"]
+    if rp:
+        upload_paths.append(rp + "progress.html")
+
+    sess = _build_session(bool(verify_tls))
+
+    last_err: Optional[ApiError] = None
+
+    for base in base_candidates:
+        for upath in upload_paths:
+            upload_url = urllib.parse.urljoin(base.rstrip("/") + "/", upath.lstrip("/"))
+            log.info("[FW] upload try url=%s", upload_url)
+
+            for attempt in range(1, max(1, int(retry.max_attempts)) + 1):
+                try:
+                    scheme = (auth_scheme or "").lower().strip()
+
+                    common_headers: dict[str, str] = {
+                        "User-Agent": "TTA-AUTO/FW-UPLOAD",
+                        "Connection": "close",
+                    }
+
+                    authz: Optional[str] = None
+
+                    if scheme == "basic":
+                        token = base64.b64encode(f"{username}:{password}".encode()).decode()
+                        authz = f"Basic {token}"
+
+                    elif scheme == "digest":
+                        try:
+                            r0 = sess.get(
+                                upload_url,
+                                headers=common_headers,
+                                timeout=float(timeout_sec),
+                                allow_redirects=False,
+                                verify=bool(verify_tls),
+                            )
+                        except Exception as e:
+                            raise _as_api_error(e)
+
+                        st0 = int(r0.status_code)
+
+                        if st0 not in (200, 401):
+                            raise ApiError(
+                                kind="http",
+                                message="unexpected progress.html status",
+                                status_code=st0,
+                            )
+
+                        if st0 == 401:
+                            www = (r0.headers.get("WWW-Authenticate") or "").strip()
+                            if not www:
+                                raise ApiError(kind="auth", message="digest challenge missing", status_code=401)
+
+                            chall = parse_www_authenticate_digest(www)
+                            authz = build_digest_authorization(
+                                method="POST",
+                                url=upload_url,
+                                username=username,
+                                password=password,
+                                challenge=chall,
+                            )
+
+                    elif scheme == "none":
+                        authz = None
+                    else:
+                        raise ApiError(kind="param", message="invalid auth_scheme", detail=str(auth_scheme))
+
+                    headers = dict(common_headers)
+                    if authz:
+                        headers["Authorization"] = authz
+
+                    post_timeout = max(float(timeout_sec), 120.0)
+
+                    with open(path, "rb") as f:
+                        files = {"upgrade": (filename, f, "application/octet-stream")}
+                        data = {"MAX_FILE_SIZE": "30000000"}
+
+                        try:
+                            r = sess.post(
+                                upload_url,
+                                headers=headers,
+                                data=data,
+                                files=files,
+                                timeout=post_timeout,
+                                allow_redirects=False,
+                                verify=bool(verify_tls),
+                            )
+                        except Exception as e:
+                            ae = _as_api_error(e)
+                            if ae.kind in ("network", "ssl", "timeout") and _is_remote_closed(ae.detail or ""):
+                                log.warning(
+                                    "[FW] remote closed connection after upload (assume reboot) url=%s",
+                                    upload_url,
+                                )
+                                return UploadResult(
+                                    status=204,
+                                    body_tail="remote closed connection (assumed reboot)",
+                                )
+                            raise ae
+
+                    st = int(r.status_code)
+                    text = r.text or ""
+
+                    if st in (200, 204, 302, 303):
+                        return UploadResult(status=st, body_tail=text[-300:])
+
+                    if st in (401, 403):
+                        raise ApiError(
+                            kind="auth",
+                            message="authentication failed",
+                            status_code=st,
+                            detail=text[:200],
+                        )
+
+                    raise ApiError(kind="http", message="upload failed", status_code=st, detail=text[:200])
+
+                except ApiError as e:
+                    last_err = e
+
+                    if attempt < int(retry.max_attempts) and e.kind in ("network", "timeout"):
+                        log.warning("[FW] retry kind=%s attempt=%s url=%s", e.kind, attempt, upload_url)
+                        _sleep_backoff(attempt, retry)
+                        continue
+
+                    break
+
+    raise last_err or ApiError(kind="network", message="upload failed")
+
+################################################################################
+FILE: http_client.py
+PATH: core/http_client.py
+################################################################################
+
+from __future__ import annotations
+
+import logging
+import ssl
+import time
+from dataclasses import dataclass
+from typing import Optional
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+from http.client import RemoteDisconnected
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.ssl_ import create_urllib3_context
+
+from config.settings import RetrySettings
+from models.dto import ApiError
+
+log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class HttpResponse:
+    status: int
+    body: str
+    headers: dict[str, str]
+
+    def header_all(self, name: str) -> list[str]:
+        k = name.lower()
+        out: list[str] = []
+        for hk, hv in (self.headers or {}).items():
+            if hk.lower() == k and hv:
+                out.append(hv)
+        return out
+
+
+def _build_ssl_context(verify_tls: bool) -> ssl.SSLContext:
+    if verify_tls:
+        ctx = ssl.create_default_context()
+    else:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+    # 구형 장비 TLS 호환(SECLEVEL 완화)
+    try:
+        ctx.set_ciphers("DEFAULT:@SECLEVEL=1")
+    except Exception:
+        pass
+
+    return ctx
+
+
+def http_get(
+    *,
+    url: str,
+    headers: Optional[dict[str, str]] = None,
+    timeout_sec: float = 6.0,
+    verify_tls: bool = False,
+    read_body: bool = True,
+) -> HttpResponse:
+    hdrs = headers or {}
+
+    if "User-Agent" not in hdrs:
+        hdrs = dict(hdrs)
+        hdrs["User-Agent"] = "AS_test_tool_v4/urllib"
+
+    req = Request(url=url, method="GET", headers=hdrs)
+    ctx = _build_ssl_context(bool(verify_tls))
+
+    try:
+        with urlopen(req, timeout=float(timeout_sec), context=ctx) as resp:
+            status = int(getattr(resp, "status", 200))
+
+            resp_headers: dict[str, str] = {}
+            for k in resp.headers.keys():
+                try:
+                    v = resp.headers.get(k)
+                    if v is not None:
+                        resp_headers[str(k)] = str(v)
+                except Exception:
+                    pass
+
+            body = ""
+            if read_body:
+                data = resp.read() if status == 200 else resp.read(8192)
+                try:
+                    body = data.decode("utf-8", errors="replace")
+                except Exception:
+                    body = str(data)
+
+            return HttpResponse(status=status, body=body, headers=resp_headers)
+
+    except HTTPError as e:
+        status = int(getattr(e, "code", 0) or 0)
+        resp_headers: dict[str, str] = {}
+        try:
+            for k in e.headers.keys():
+                v = e.headers.get(k)
+                if v is not None:
+                    resp_headers[str(k)] = str(v)
+        except Exception:
+            pass
+
+        body = ""
+        if read_body:
+            try:
+                data = e.read(8192)
+                body = data.decode("utf-8", errors="replace")
+            except Exception:
+                body = ""
+
+        return HttpResponse(status=status, body=body, headers=resp_headers)
+
+    except ssl.SSLError as e:
+        raise ApiError(kind="ssl", message="ssl handshake error", detail=str(e))
+    except RemoteDisconnected as e:
+        raise ApiError(kind="network", message="remote disconnected", detail=str(e))
+    except URLError as e:
+        raise ApiError(kind="network", message="network error", detail=str(e))
+    except TimeoutError as e:
+        raise ApiError(kind="timeout", message="timeout", detail=str(e))
+    except Exception as e:
+        raise ApiError(kind="network", message="request failed", detail=str(e))
+
+
+def http_get_with_retry(
+    *,
+    url: str,
+    headers: Optional[dict[str, str]] = None,
+    timeout_sec: float = 6.0,
+    verify_tls: bool = False,
+    read_body: bool = True,
+    retry: Optional[RetrySettings] = None,
+) -> HttpResponse:
+    retry = retry or RetrySettings()
+    attempts = max(1, int(getattr(retry, "max_attempts", 1) or 1))
+
+    last: Optional[ApiError] = None
+
+    for i in range(attempts):
+        try:
+            return http_get(
+                url=url,
+                headers=headers,
+                timeout_sec=timeout_sec,
+                verify_tls=verify_tls,
+                read_body=read_body,
+            )
+        except ApiError as e:
+            last = e
+
+            if i < attempts - 1 and e.kind in ("network", "timeout"):
+                backoff = float(retry.backoff_base_sec) * (2 ** i)
+                time.sleep(max(0.0, backoff))
+
+    raise last or ApiError(kind="network", message="request failed")
+
+
+class _TlsCompatAdapter(HTTPAdapter):
+    def __init__(self, verify_tls: bool, **kwargs):
+        self._verify_tls = bool(verify_tls)
+        super().__init__(**kwargs)
+
+    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+        ctx = create_urllib3_context()
+        if not self._verify_tls:
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        try:
+            ctx.set_ciphers("DEFAULT:@SECLEVEL=1")
+        except Exception:
+            pass
+        pool_kwargs["ssl_context"] = ctx
+        return super().init_poolmanager(connections, maxsize, block=block, **pool_kwargs)
+
+
+def _build_session(verify_tls: bool) -> requests.Session:
+    sess = requests.Session()
+    adapter = _TlsCompatAdapter(
+        verify_tls=verify_tls,
+        pool_connections=10,
+        pool_maxsize=10,
+        max_retries=0,
+    )
+    sess.mount("https://", adapter)
+    sess.mount("http://", adapter)
+    return sess
+
+################################################################################
+FILE: kv_utils.py
+PATH: core/kv_utils.py
+################################################################################
+
+from __future__ import annotations
+
+from typing import Iterable
+
+
+def parse_kv_lines(text: str) -> dict[str, str]:
+    """
+    KEY=VALUE 형식의 라인을 파싱한다.
+    """
+    out: dict[str, str] = {}
+    for line in (text or "").splitlines():
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        v = v.strip()
+        if not k:
+            continue
+        out[k] = v
+    return out
+
+
+def pick(kv: dict[str, str], *cands: str) -> str | None:
+    """
+    후보 키 중 첫 번째 유효 값을 반환한다.
+    """
+    for c in cands:
+        v = kv.get(c)
+        if v not in (None, ""):
+            return v
+    return None
+
+
+def join_kv_dicts(*dicts: Iterable[dict[str, str]]) -> dict[str, str]:
+    """
+    여러 dict를 순차적으로 병합한다. (후행 dict 우선)
+    """
+    out: dict[str, str] = {}
+    for d in dicts:
+        for x in d:
+            out.update(x)
+    return out
+
+################################################################################
+FILE: password_change.py
+PATH: core/password_change.py
+################################################################################
+
+from __future__ import annotations
+
+import base64
+import logging
+import time
+from dataclasses import dataclass
+from urllib.parse import quote
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+
+from core.cam_api_client import CamApiClient
+from models.dto import ApiError
+
+log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class PasswordChangeResult:
+    ok: bool
+    used_password: str
+    changed_to: str
+    detail: str | None = None
+
+
+def tencryption_js(s: str) -> str:
+    if not s:
+        s = ""
+    return base64.b64encode(s.encode("utf-8")).decode("ascii")
+
+
+def tencode_url_js(b64_str: str) -> str:
+    if not b64_str:
+        return ""
+    converted = b64_str.replace("+", "-").replace("/", "_").rstrip("=")
+    if len(converted) == 0:
+        return ""
+    first = b64_str[len(converted) - 1]
+    second = b64_str[len(converted) // 2]
+    return first + second + converted
+
+
+def rsa_encrypt_with_pem(public_key_pem: str, msg: str) -> str:
+    key = serialization.load_pem_public_key(public_key_pem.encode())
+    encrypted = key.encrypt(msg.encode(), padding.PKCS1v15())
+    return base64.b64encode(encrypted).decode()
+
+
+def _encode_component(s: str) -> str:
+    return quote(s, safe="")
+
+
+def _write_usr_modpass(cli: CamApiClient, username: str, enc_old: str, enc_new: str) -> str | None:
+    msg = (
+        "USR_MODPASS="
+        + quote(username, safe="")
+        + ":"
+        + _encode_component(enc_old)
+        + ":"
+        + _encode_component(enc_new)
+    )
+
+    tail = f"WriteParam?action=writeparam&{msg}"
+    resp = cli._request(tail)  # pylint: disable=protected-access
+
+    if resp.status == 200:
+        return resp.body or ""
+
+    if resp.status in (401, 403):
+        raise ApiError(
+            kind="auth",
+            message="authentication failed",
+            status_code=resp.status,
+            detail=(resp.body or "")[:200],
+        )
+
+    raise ApiError(
+        kind="http",
+        message="password change rejected",
+        status_code=resp.status,
+        detail=(resp.body or "")[:300],
+    )
+
+
+def _verify_new_password(
+    *,
+    base_url: str,
+    root_path: str,
+    username: str,
+    new_password: str,
+    auth_scheme: str,
+    timeout_sec: float,
+    verify_tls: bool,
+) -> None:
+    cli_new = CamApiClient(
+        base_url=base_url,
+        root_path=root_path,
+        username=username,
+        password=new_password,
+        auth_scheme=auth_scheme,
+        timeout=_SimpleTimeout(connect_sec=timeout_sec, read_sec=timeout_sec),
+        retry=_SimpleRetry(max_attempts=1),
+        verify_tls=verify_tls,
+    )
+
+    last_err: Exception | None = None
+    for _ in range(8):
+        try:
+            _ = cli_new.read_param_text("SYS_VERSION")
+            return
+        except Exception as e:
+            last_err = e
+            try:
+                _ = cli_new.read_param_text("ETC_MIN_PASSWORD_LEN")
+                return
+            except Exception as e2:
+                last_err = e2
+                time.sleep(0.6)
+
+    raise ApiError(
+        kind="auth",
+        message="verify failed after password change",
+        status_code=401,
+        detail=str(last_err)[:300] if last_err else None,
+    )
+
+
+def change_password_if_needed(
+    *,
+    base_url: str,
+    root_path: str,
+    username: str,
+    old_password: str,
+    new_password: str,
+    timeout_sec: float = 6.0,
+    verify_tls: bool = False,
+    auth_scheme: str = "digest",
+) -> None:
+    cli_old = CamApiClient(
+        base_url=base_url,
+        root_path=root_path,
+        username=username,
+        password=old_password,
+        auth_scheme=auth_scheme,
+        timeout=_SimpleTimeout(connect_sec=timeout_sec, read_sec=timeout_sec),
+        retry=_SimpleRetry(max_attempts=1),
+        verify_tls=verify_tls,
+    )
+
+    crypto_type = 0
+    public_key_pem = ""
+
+    try:
+        txt = cli_old.read_param_text("SYS_PUBLIC_KEY_CRYPTO")
+        crypto_type = 1 if "SYS_PUBLIC_KEY_CRYPTO=1" in (txt or "") else 0
+    except Exception:
+        crypto_type = 0
+
+    if crypto_type == 1:
+        try:
+            txt2 = cli_old.read_param_text("SYS_PUBLIC_KEY")
+            if "SYS_PUBLIC_KEY=" in (txt2 or ""):
+                raw = txt2.split("SYS_PUBLIC_KEY=", 1)[1].strip()
+                if "BEGIN PUBLIC KEY" in raw:
+                    public_key_pem = raw
+                else:
+                    public_key_pem = "-----BEGIN PUBLIC KEY-----\n" + raw + "\n-----END PUBLIC KEY-----"
+        except Exception:
+            public_key_pem = ""
+
+    if crypto_type == 1 and public_key_pem:
+        try:
+            enc_old = rsa_encrypt_with_pem(public_key_pem, old_password)
+            enc_new = rsa_encrypt_with_pem(public_key_pem, new_password)
+
+            log.info("[MODPASS] RSA call")
+            body = _write_usr_modpass(cli_old, username, enc_old, enc_new)
+
+            if body is None or (body or "").lstrip().lower().startswith("ok"):
+                _verify_new_password(
+                    base_url=base_url,
+                    root_path=root_path,
+                    username=username,
+                    new_password=new_password,
+                    auth_scheme=auth_scheme,
+                    timeout_sec=timeout_sec,
+                    verify_tls=verify_tls,
+                )
+                return
+
+            log.info("[MODPASS] RSA rejected; fallback to TENC")
+
+        except Exception as e:
+            log.info("[MODPASS] RSA failed (%s); fallback to TENC", e)
+
+    b64_old = tencryption_js(old_password)
+    b64_new = tencryption_js(new_password)
+    enc_old = tencode_url_js(b64_old)
+    enc_new = tencode_url_js(b64_new)
+
+    log.info("[MODPASS] TENC call")
+    body = _write_usr_modpass(cli_old, username, enc_old, enc_new)
+
+    if body is not None and not (body or "").lstrip().lower().startswith("ok"):
+        raise ApiError(kind="http", message="password change rejected", detail=(body or "")[:300])
+
+    _verify_new_password(
+        base_url=base_url,
+        root_path=root_path,
+        username=username,
+        new_password=new_password,
+        auth_scheme=auth_scheme,
+        timeout_sec=timeout_sec,
+        verify_tls=verify_tls,
+    )
+
+
+def try_recover_password(
+    *,
+    base_url: str,
+    root_path: str,
+    username: str,
+    password_candidates: list[str],
+    target_password: str,
+    timeout_sec: float = 6.0,
+    verify_tls: bool = False,
+    auth_scheme: str = "digest",
+) -> PasswordChangeResult:
+    if not password_candidates:
+        raise ApiError(kind="param", message="password_candidates empty")
+    if not target_password:
+        raise ApiError(kind="param", message="target_password empty")
+
+    last_err: ApiError | None = None
+
+    for old_pw in password_candidates:
+        try:
+            change_password_if_needed(
+                base_url=base_url,
+                root_path=root_path,
+                username=username,
+                old_password=old_pw,
+                new_password=target_password,
+                timeout_sec=timeout_sec,
+                verify_tls=verify_tls,
+                auth_scheme=auth_scheme,
+            )
+            return PasswordChangeResult(ok=True, used_password=old_pw, changed_to=target_password)
+
+        except ApiError as e:
+            last_err = e
+            log.warning(
+                "[PW] recover fail old=%s kind=%s status=%s msg=%s",
+                "*" * len(old_pw),
+                e.kind,
+                e.status_code,
+                e.message,
+            )
+            continue
+        except Exception as e:
+            last_err = ApiError(kind="network", message="password recover failed", detail=str(e))
+            continue
+
+    raise last_err or ApiError(kind="auth", message="password recover failed")
+
+
+@dataclass(frozen=True)
+class _SimpleTimeout:
+    connect_sec: float = 6.0
+    read_sec: float = 6.0
+
+
+@dataclass(frozen=True)
+class _SimpleRetry:
+    max_attempts: int = 1
+    retry_on_status: tuple[int, ...] = ()
+    backoff_base_sec: float = 0.1
+    backoff_jitter_sec: float = 0.05
+
+################################################################################
+FILE: phase3_api.py
+PATH: core/phase3_api.py
+################################################################################
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from urllib.parse import quote
+
+from core.cam_api_client import CamApiClient
+from core.kv_utils import parse_kv_lines
+from models.dto import ApiError
+
+
+@dataclass(frozen=True)
+class Phase3Api:
+    """
+    Phase3(WriteParam/SetState/SendPTZ) wrapper.
+
+    PTZ는 Web UI 규격(PTZ_CHANNEL, PTZ_MOVE, PTZ_TIMEOUT)을 사용한다.
+    """
+    client: CamApiClient
+
+    def read_value(self, key: str) -> str:
+        txt = self.client.read_param_text(key)
+        kv = parse_kv_lines(txt)
+        return kv.get(key, "")
+
+    def write_param(self, key: str, value: str) -> None:
+        kq = quote(key, safe="")
+        vq = quote(value or "", safe="")
+        tail = f"WriteParam?action=writeparam&{kq}={vq}"
+        resp = self.client._request(tail)  # pylint: disable=protected-access
+
+        if resp.status == 200:
+            return
+        if resp.status in (401, 403):
+            raise ApiError(
+                kind="auth",
+                message="authentication failed",
+                status_code=resp.status,
+                detail=(resp.body or "")[:200],
+            )
+        raise ApiError(
+            kind="http",
+            message="write_param failed",
+            status_code=resp.status,
+            detail=(resp.body or "")[:200],
+        )
+
+    def set_state(self, key: str, value: str) -> None:
+        kq = quote(key, safe="")
+        vq = quote(value or "", safe="")
+        tail = f"SetState?action=setstate&{kq}={vq}"
+        resp = self.client._request(tail)  # pylint: disable=protected-access
+
+        if resp.status == 200:
+            return
+        if resp.status in (401, 403):
+            raise ApiError(
+                kind="auth",
+                message="authentication failed",
+                status_code=resp.status,
+                detail=(resp.body or "")[:200],
+            )
+        raise ApiError(
+            kind="http",
+            message="set_state failed",
+            status_code=resp.status,
+            detail=(resp.body or "")[:200],
+        )
+
+    def send_ptz_move(self, *, channel: int, move: str, timeout_ms: int | None = 5000) -> None:
+        """
+        SendPTZ?action=sendptz&PTZ_CHANNEL=1&PTZ_MOVE=right,9&PTZ_TIMEOUT=5000
+        SendPTZ?action=sendptz&PTZ_CHANNEL=1&PTZ_MOVE=stop
+        """
+        params: list[str] = [
+            "action=sendptz",
+            f"PTZ_CHANNEL={int(channel)}",
+            f"PTZ_MOVE={quote(move or '', safe=',')}",
+        ]
+        if timeout_ms is not None and (move or "").lower() != "stop":
+            params.append(f"PTZ_TIMEOUT={int(timeout_ms)}")
+
+        tail = "SendPTZ?" + "&".join(params)
+        resp = self.client._request(tail)  # pylint: disable=protected-access
+
+        if resp.status == 200:
+            body = (resp.body or "").strip().lower()
+            if body and any(x in body for x in ("ng", "error", "fail", "invalid")):
+                raise ApiError(
+                    kind="compat",
+                    message="ptz rejected",
+                    status_code=200,
+                    detail=(resp.body or "")[:200],
+                )
+            return
+
+        if resp.status in (401, 403):
+            raise ApiError(
+                kind="auth",
+                message="authentication failed",
+                status_code=resp.status,
+                detail=(resp.body or "")[:200],
+            )
+
+        raise ApiError(
+            kind="http",
+            message="send_ptz_move failed",
+            status_code=resp.status,
+            detail=(resp.body or "")[:200],
+        )
+
+    def send_ptz(self, cmd_key: str, value: str, *, speed: int | None = None, ch: int | None = None) -> None:
+        raise ApiError(
+            kind="compat",
+            message="legacy PTZ key/value mode is not supported on this firmware; use send_ptz_move(PTZ_MOVE...)",
+            detail=f"cmd_key={cmd_key!r} value={value!r} speed={speed!r} ch={ch!r}",
+        )
+
+################################################################################
+FILE: probe.py
+PATH: core/probe.py
+################################################################################
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import Optional
+
+from core.http_client import http_get_with_retry
+from models.dto import ApiError
+
+log = logging.getLogger(__name__)
+
+_ROOT_CANDIDATES = (
+    "/httpapx/",
+    "/httpapi/",
+    "/webapi/",
+)
+
+
+@dataclass(frozen=True)
+class ProbeResult:
+    base_url: str          # e.g. https://ip:443 or http://ip:80
+    root_path: str         # e.g. /httpapx/
+    auth_scheme: str       # "none" | "digest" | "basic"
+    flavor: str = "legacy"  # "legacy" | "security3" (best-effort)
+
+
+def _normalize_root(root: str) -> str:
+    root = (root or "").strip()
+    if not root.startswith("/"):
+        root = "/" + root
+    if not root.endswith("/"):
+        root += "/"
+    return root
+
+
+def _contains_digest(www: list[str]) -> bool:
+    return any(h and "digest" in h.lower() for h in (www or []))
+
+
+def _contains_basic(www: list[str]) -> bool:
+    return any(h and "basic" in h.lower() for h in (www or []))
+
+
+def _port_candidates(port: int) -> list[int]:
+    """
+    port == 0: AUTO
+    """
+    try:
+        p = int(port)
+    except Exception:
+        p = 0
+
+    if p <= 0:
+        return [443, 80, 8443]
+
+    out = [p]
+    if p != 443:
+        out.append(443)
+    if p != 80:
+        out.append(80)
+    if p != 8443:
+        out.append(8443)
+    return out
+
+
+def _base_candidates(ip: str, port: int) -> list[str]:
+    out: list[str] = []
+    for p in _port_candidates(port):
+        if p in (443, 8443):
+            out.append(f"https://{ip}:{p}")
+            out.append(f"http://{ip}:{p}")
+        else:
+            out.append(f"http://{ip}:{p}")
+            out.append(f"https://{ip}:{p}")
+
+    uniq: list[str] = []
+    for u in out:
+        if u not in uniq:
+            uniq.append(u)
+    return uniq
+
+
+def probe_camera(
+    ip: str,
+    port: int,
+    timeout_sec: float = 2.5,
+    verify_tls: bool = False,
+) -> ProbeResult:
+    """
+    - root 후보(/httpapi/, /httpapx/, /webapi/) 탐색
+    - auth scheme 판별 (none/basic/digest)
+    - 일부 장비는 ETC_MIN_PASSWORD_LEN에서 400을 반환해 SYS_VERSION으로 1회 폴백
+    - 보안3.0: SYS_PUBLIC_KEY=0 이 무인증 200이면 security3로 판단
+    - port==0(AUTO) 지원
+    """
+    bases = _base_candidates(ip, port)
+
+    root_candidates = (
+        "/httpapi/",
+        "/httpapx/",
+        "/webapi/",
+    )
+
+    test_q_primary = "ETC_MIN_PASSWORD_LEN=0"
+    test_q_fallback = "SYS_VERSION=0"
+    test_q_security3 = "SYS_PUBLIC_KEY=0"
+
+    last_err: Optional[ApiError] = None
+
+    for base in bases:
+        base_is_https = base.lower().startswith("https://")
+
+        for root in root_candidates:
+            root_norm = _normalize_root(root)
+
+            def _try(q: str):
+                url = f"{base}{root_norm}ReadParam?action=readparam&{q}"
+                return http_get_with_retry(
+                    url=url,
+                    timeout_sec=timeout_sec,
+                    verify_tls=verify_tls,
+                )
+
+            try:
+                resp = _try(test_q_primary)
+                sc = resp.status
+
+                if sc == 400:
+                    log.info(
+                        "[PROBE] got 400 on primary key; fallback to SYS_VERSION base=%s root=%s",
+                        base,
+                        root_norm,
+                    )
+                    resp2 = _try(test_q_fallback)
+                    sc2 = resp2.status
+
+                    if sc2 in (400, 401, 403):
+                        log.info("[PROBE] security3 candidate: %s", base)
+                        resp3 = _try(test_q_security3)
+                        if resp3.status == 200:
+                            log.info("[PROBE] OK (security3 none) base=%s root=%s", base, root_norm)
+                            return ProbeResult(base_url=base, root_path=root_norm, auth_scheme="none", flavor="security3")
+
+                    resp = resp2
+                    sc = sc2
+
+                if sc == 200:
+                    log.info("[PROBE] OK (none) base=%s root=%s", base, root_norm)
+                    return ProbeResult(base_url=base, root_path=root_norm, auth_scheme="none", flavor="legacy")
+
+                if sc in (401, 403):
+                    www = resp.header_all("WWW-Authenticate") if hasattr(resp, "header_all") else []
+                    if _contains_digest(www):
+                        log.info("[PROBE] OK (digest) base=%s root=%s status=%s", base, root_norm, sc)
+                        return ProbeResult(base_url=base, root_path=root_norm, auth_scheme="digest", flavor="legacy")
+                    if _contains_basic(www):
+                        log.info("[PROBE] OK (basic) base=%s root=%s status=%s", base, root_norm, sc)
+                        return ProbeResult(base_url=base, root_path=root_norm, auth_scheme="basic", flavor="legacy")
+
+                    detail = "; ".join([w for w in (www or []) if w])[:300]
+                    raise ApiError(kind="compat", message="unsupported auth scheme", status_code=sc, detail=detail)
+
+                if sc == 404:
+                    continue
+
+                raise ApiError(kind="http", message="probe failed", status_code=sc, detail=(resp.body or "")[:200])
+
+            except ApiError as e:
+                last_err = e
+                log.warning(
+                    "[PROBE] fail kind=%s base=%s root=%s msg=%s detail=%s",
+                    e.kind,
+                    base,
+                    root_norm,
+                    e.message,
+                    (e.detail or "")[:200],
+                )
+
+                if base_is_https and e.kind == "ssl":
+                    break
+
+                continue
+
+    raise last_err or ApiError(kind="network", message="probe failed", detail="no response")
+
+################################################################################
+FILE: readparam_keys.py
+PATH: core/readparam_keys.py
+################################################################################
+
+from __future__ import annotations
+
+# ----------------------------------------------------------------------
+# ReadParam request structure
+# ----------------------------------------------------------------------
+# Fixed pattern:
+#   GET /httpapi/ReadParam?action=readparam&KEY=0
+#   GET /httpapi/ReadParam?action=readparam&KEY1=0&KEY2=0&...
+# ----------------------------------------------------------------------
+
+
+# ----------------------------------------------------------------------
+# Network
+# ----------------------------------------------------------------------
+READPARAM_NETWORK_KEYS: tuple[str, ...] = (
+    "NET_RTSPPORT",
+    "NET_MAC",
+    "NET_LOCALIPMODE",
+)
+
+
+# ----------------------------------------------------------------------
+# System / identity / runtime
+# ----------------------------------------------------------------------
+READPARAM_SYSTEM_KEYS: tuple[str, ...] = (
+    "SYS_BOARDID",
+    "SYS_MODE",
+    "SYS_MODELNAME_ID",
+    "SYS_VERSION",
+    "SYS_MODULE_TYPE",
+    "SYS_MODULE_DETAIL",
+    "SYS_PTZ_TYPE",
+    "SYS_LINKDOWN_NUM",
+    "SYS_RCV_VERSION",
+    "SYS_TIMEFORMAT",
+    "SYS_STARTTIME",
+    "SYS_FTCAMERA_CDS",
+    "SYS_AI_VERSION",
+    "SYS_ZOOMMODULE",
+    "SYS_PRODUCT_MODEL",
+    "SYS_ONVIFVERSION",
+    "SYS_OPENSSLVERSION",
+    "SYS_CURRENTTIME",
+)
+
+
+# ----------------------------------------------------------------------
+# Camera / module / hardware version
+# ----------------------------------------------------------------------
+READPARAM_CAMERA_VERSION_KEYS: tuple[str, ...] = (
+    "CAM_READMODULEVERSION",
+    "CAM_READMECAVERSION",
+    "CAM_READPTZHWVERSION",
+)
+
+
+# ----------------------------------------------------------------------
+# Video
+# ----------------------------------------------------------------------
+READPARAM_VIDEO_KEYS: tuple[str, ...] = (
+    "VID_PREVIEWENABLE",
+    "VID_OUTPUTFORMAT",
+    "VID_INPUTFORMAT",
+    "VID_RESOLUTION",
+    "VID_FRAMERATE",
+    "VID_PREFERENCE",
+    "VID_QUALITY",
+    "VID_BANDWIDTH",
+    "VID_IINTERVAL",
+    "VID_USEDUAL",
+    "VID_DUALALGORITHM",
+    "VID_DUALRESOLUTION",
+    "VID_DUALFRAMERATE",
+    "VID_DUALPREFERENCE",
+    "VID_DUALQUALITY",
+    "VID_DUALBANDWIDTH",
+    "VID_DUALIINTERVAL",
+)
+
+
+# ----------------------------------------------------------------------
+# Audio
+# ----------------------------------------------------------------------
+READPARAM_AUDIO_KEYS: tuple[str, ...] = (
+    "AUD_ALGORITHM",
+    "AUD_AUDIOMODE",
+    "AUD_GAIN",
+    "AUD_BITRATE",
+)
+
+
+# ----------------------------------------------------------------------
+# Audio capability / project-used extension keys
+# ----------------------------------------------------------------------
+READPARAM_AUDIO_CAPABILITY_KEYS: tuple[str, ...] = (
+    "AUD_ENABLE",
+    "AUD_CODEC",
+    "AUD_INPUTGAIN",
+    "AUD_OUTPUTGAIN",
+    "AUD_SAMPLERATE",
+    "AUD_MUTE",
+)
+
+
+# ----------------------------------------------------------------------
+# Storage
+# ----------------------------------------------------------------------
+READPARAM_STORAGE_KEYS: tuple[str, ...] = (
+    "REC_DISKTYPE",
+    "REC_DISKSIZE",
+    "REC_DISKAVAILABLE",
+)
+
+
+# ----------------------------------------------------------------------
+# Misc / serial / project-used additions
+# ----------------------------------------------------------------------
+READPARAM_PROJECT_EXTRA_KEYS: tuple[str, ...] = (
+    "SER_BITRATE_2",
+)
+
+
+# ----------------------------------------------------------------------
+# Test
+# ----------------------------------------------------------------------
+READPARAM_TEST_KEYS: tuple[str, ...] = (
+    "TEST_Power_CheckString",
+)
+
+
+# ----------------------------------------------------------------------
+# Device info summary keys
+# ----------------------------------------------------------------------
+DEVICE_INFO_KEYS: tuple[str, ...] = (
+    "NET_MAC",
+    "SYS_MODELNAME_ID",
+    "SYS_VERSION",
+    "SYS_MODE",
+    "CAM_READMODULEVERSION",
+    "CAM_READMECAVERSION",
+    "SYS_LINKDOWN_NUM",
+    "NET_LOCALIPMODE",
+    "TEST_Power_CheckString",
+    "SYS_STARTTIME",
+    "REC_DISKTYPE",
+    "REC_DISKSIZE",
+    "REC_DISKAVAILABLE",
+    "SYS_AI_VERSION",
+    "SYS_RCV_VERSION",
+)
+
+
+# ----------------------------------------------------------------------
+# Fast / slow partition for CamInfoReader
+# ----------------------------------------------------------------------
+DEVICE_INFO_FAST_KEYS: tuple[str, ...] = (
+    "NET_MAC",
+    "NET_LOCALIPMODE",
+
+    "SYS_MODELNAME_ID",
+    "SYS_VERSION",
+    "SYS_MODE",
+    "SYS_LINKDOWN_NUM",
+    "SYS_RCV_VERSION",
+    "SYS_STARTTIME",
+    "SYS_AI_VERSION",
+
+    "REC_DISKTYPE",
+    "REC_DISKSIZE",
+    "REC_DISKAVAILABLE",
+
+    "SYS_BOARDID",
+    "SYS_MODULE_TYPE",
+    "SYS_MODULE_DETAIL",
+    "SYS_PTZ_TYPE",
+    "SYS_ZOOMMODULE",
+    "SYS_PRODUCT_MODEL",
+
+    "SER_BITRATE_2",
+    "TEST_Power_CheckString",
+)
+
+DEVICE_INFO_SLOW_KEYS: tuple[str, ...] = (
+    "CAM_READMECAVERSION",
+    "CAM_READMODULEVERSION",
+    "CAM_READPTZHWVERSION",
+    "SYS_ONVIFVERSION",
+    "SYS_OPENSSLVERSION",
+    "SYS_CURRENTTIME",
+)
+
+
+# ----------------------------------------------------------------------
+# CamStatusReader keys
+# ----------------------------------------------------------------------
+STATUS_READPARAM_KEYS: tuple[str, ...] = (
+    "SYS_BOARDTEMP",
+    "SYS_BOARD_TEMP",
+    "ETC_BOARDTEMP",
+    "CAM_HI_CURRENT_Y",
+    "GIS_CDS",
+    "GIS_CDS_CUR",
+    "GIS_CDS_CURRENT",
+    "SYS_CURRENTTIME",
+    "GIS_RTC",
+    "RTC_TIME",
+    "SYS_FANSTATUS",
+    "SYS_FAN_STATUS",
+    "FAN_STATUS",
+)
+
+STATUS_RATE_KEYS: tuple[str, ...] = (
+    "GRS_VENCFRAME1",
+    "GRS_VENCBITRATE1",
+    "GRS_VENCFRAME2",
+    "GRS_VENCBITRATE2",
+    "GRS_VENCFRAME3",
+    "GRS_VENCBITRATE3",
+    "GRS_VENCFRAME4",
+    "GRS_VENCBITRATE4",
+    "GRS_AENCBITRATE1",
+    "GRS_ADECBITRATE1",
+    "GRS_ADECALGORITHM1",
+    "GRS_ADECSAMPLERATE1",
+)
+
+STATUS_INPUT_KEYS: tuple[str, ...] = (
+    "GIS_SENSOR1",
+    "GIS_SENSOR2",
+    "GIS_SENSOR3",
+    "GIS_SENSOR4",
+    "GIS_SENSOR5",
+    "GIS_MOTION1",
+    "GIS_MOTION2",
+    "GIS_MOTION3",
+    "GIS_MOTION4",
+    "GIS_VIDEOLOSS1",
+    "GIS_VIDEOLOSS2",
+    "GIS_VIDEOLOSS3",
+    "GIS_VIDEOLOSS4",
+    "GIS_ALARM1",
+    "GIS_ALARM2",
+    "GIS_ALARM3",
+    "GIS_ALARM4",
+    "GIS_RECORD1",
+    "GIS_AIRWIPER",
+)
+
+STATUS_ETHTOOL_KEYS: tuple[str, ...] = (
+    "ETHTOOL",
+)
+
+
+# ----------------------------------------------------------------------
+# Full dump
+# ----------------------------------------------------------------------
+READPARAM_FULL_DUMP_KEYS: tuple[str, ...] = (
+    READPARAM_NETWORK_KEYS
+    + READPARAM_SYSTEM_KEYS
+    + READPARAM_CAMERA_VERSION_KEYS
+    + READPARAM_VIDEO_KEYS
+    + READPARAM_AUDIO_KEYS
+    + READPARAM_AUDIO_CAPABILITY_KEYS
+    + READPARAM_STORAGE_KEYS
+    + READPARAM_PROJECT_EXTRA_KEYS
+    + READPARAM_TEST_KEYS
+)
+
